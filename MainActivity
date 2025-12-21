@@ -1,0 +1,121 @@
+implementation("com.google.android.exoplayer:exoplayer:2.19.1")
+implementation("com.google.android.exoplayer:exoplayer-core:2.19.1")
+implementation("com.google.android.exoplayer:exoplayer-ui:2.19.1")package com.manobrown.audiomaster
+
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothA2dp
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothProfile
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.net.Uri
+import android.os.Bundle
+import androidx.appcompat.app.AppCompatActivity
+import com.google.android.exoplayer2.ExoPlayer
+import com.google.android.exoplayer2.MediaItem
+import com.google.android.exoplayer2.PlaybackParameters
+import com.google.android.exoplayer2.Player
+import com.google.android.exoplayer2.audio.AudioAttributes
+import com.google.android.exoplayer2.audio.AudioSink
+import com.google.android.exoplayer2.ui.PlayerView
+import android.util.Log
+import java.lang.reflect.Method
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var player: ExoPlayer
+    private lateinit var playerView: PlayerView
+
+    @SuppressLint("MissingPermission")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        playerView = findViewById(R.id.player_view)
+
+        // Configura ExoPlayer com áudio de alta qualidade
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(com.google.android.exoplayer2.C.USAGE_MEDIA)
+            .setContentType(com.google.android.exoplayer2.C.CONTENT_TYPE_MUSIC)
+            .build()
+
+        player = ExoPlayer.Builder(this)
+            .setAudioAttributes(audioAttributes, true) // handleAudioFocus = true
+            .setHandleAudioBecomingNoisy(true)
+            .build()
+
+        playerView.player = player
+
+        // Força alta resolução (24-bit quando disponível)
+        forceHighQualityBluetooth()
+
+        // Exemplo: toca uma música local ou URL
+        val uri = Uri.parse("file:///storage/emulated/0/Music/tua_musica_foda.flac") // ou URL online
+        val mediaItem = MediaItem.fromUri(uri)
+        player.setMediaItem(mediaItem)
+        player.prepare()
+        player.play()
+
+        // Opcional: força 48 kHz no output (funciona melhor em Snapdragon)
+        player.playbackParameters = PlaybackParameters(1.0f) // pitch normal
+    }
+
+    // MAGIA: Força LDAC em qualidade máxima (990 kbps)
+    @SuppressLint("MissingPermission", "DiscouragedPrivateApi")
+    private fun forceHighQualityBluetooth() {
+        val bluetoothAdapter = BluetoothAdapter.getDefaultAdapter() ?: return
+        bluetoothAdapter.getProfileProxy(this, object : BluetoothProfile.ServiceListener {
+            override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                if (profile == BluetoothProfile.A2DP) {
+                    val a2dp = proxy as BluetoothA2dp
+                    try {
+                        // Reflexão pra acessar o método oculto setCodecConfigPreference
+                        val device = a2dp.activeDevice ?: return
+                        val method: Method = BluetoothA2dp::class.java.getDeclaredMethod(
+                            "setCodecConfigPreference",
+                            android.bluetooth.BluetoothDevice::class.java,
+                            android.bluetooth.BluetoothCodecConfig::class.java
+                        )
+                        method.isAccessible = true
+
+                        // LDAC máxima qualidade: 990 kbps, 96 kHz (mas teu Poco X7 aceita até 48 kHz estável)
+                        val codecConfig = android.bluetooth.BluetoothCodecConfig.Builder()
+                            .setCodecType(android.bluetooth.BluetoothCodecConfig.SOURCE_CODEC_TYPE_LDAC)
+                            .setCodecPriority(android.bluetooth.BluetoothCodecConfig.CODEC_PRIORITY_HIGHEST)
+                            .setSampleRate(android.bluetooth.BluetoothCodecConfig.SAMPLE_RATE_48000) // 48 kHz como tu pediu
+                            .setBitsPerSample(android.bluetooth.BluetoothCodecConfig.BITS_PER_SAMPLE_24)
+                            .setChannelMode(android.bluetooth.BluetoothCodecConfig.CHANNEL_MODE_STEREO)
+                            .setCodecSpecific1(1000001) // LDAC Quality: 990 kbps (highest)
+                            .setCodecSpecific2(0)
+                            .setCodecSpecific3(0)
+                            .setCodecSpecific4(0)
+                            .build()
+
+                        method.invoke(a2dp, device, codecConfig)
+                        Log.d("LDAC_FORCE", "LDAC forçado em 990 kbps / 48 kHz / 24-bit no ${device.name}")
+                    } catch (e: Exception) {
+                        Log.e("LDAC_ERROR", "Não conseguiu forçar LDAC (fone não compatível?)", e)
+                    }
+                }
+                bluetoothAdapter.closeProfileProxy(profile, proxy)
+            }
+
+            override fun onServiceDisconnected(profile: Int) {}
+        }, BluetoothProfile.A2DP)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        player.release()
+    }
+}<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <com.google.android.exoplayer2.ui.PlayerView
+        android:id="@+id/player_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>
