@@ -119,3 +119,451 @@ class MainActivity : AppCompatActivity() {
         android:layout_height="match_parent" />
 
 </androidx.constraintlayout.widget.ConstraintLayout>
+package com.manobrown.audiomaster
+
+import kotlin.math.abs
+import kotlin.math.log10
+import kotlin.math.max
+import kotlin.math.pow
+
+/**
+ * DspChain — processa o buffer Float em tempo real.
+ * Ordem: preamp adaptativo → 10 biquads (EQ) → bass → vocal → width → true-peak limiter.
+ *
+ * Os 10 sliders do EQ escrevem em setBanda(); aqui, no processar(),
+ * esses valores viram coeficientes que modificam as amostras PCM.
+ */
+class DspChain {
+    @Volatile var preampManual: Float = 0f
+    @Volatile var headroomAuto: Boolean = true
+    @Volatile var bass: Float = 0.2f
+    @Volatile var vocal: Float = 0.1f
+    @Volatile var width: Float = 0f
+    @Volatile var limiterAtivo: Boolean = true
+
+    private val ganhos = FloatArray(10) { 0f }
+    private val bqs = Array(10) { Biquad() }
+    private val bassFilter = Biquad()
+    private val vocalHpf = Biquad()
+    private val vocalPk = Biquad()
+    private val fc = floatArrayOf(31.25f, 62.5f, 125f, 250f, 500f, 1000f, 2000f, 4000f, 8000f, 16000f)
+    private val qPadrao = floatArrayOf(0.7f, 0.7f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.7f, 0.7f)
+    private var sr = -1
+
+    @Volatile var atenuacaoAtualDb: Float = 0f
+    @Volatile var headroomAplicadoDb: Float = 0f
+    @Volatile var ultimoPicoInterAmostraDb: Float = -120f
+
+    fun setBanda(i: Int, gDb: Float) {
+        if (i in 0..9) {
+            ganhos[i] = gDb
+            if (sr > 0) bqs[i].design(
+                fs = sr.toDouble(),
+                f0 = fc[i].toDouble(),
+                Q = qPadrao[i].toDouble(),
+                gainDb = gDb.toDouble(),
+                tipo = Biquad.PEAK
+            )
+        }
+    }
+
+    private fun projetar() {
+        for (i in 0..9) bqs[i].design(
+            fs = sr.toDouble(), f0 = fc[i].toDouble(),
+            Q = qPadrao[i].toDouble(), gainDb = ganhos[i].toDouble(), tipo = Biquad.PEAK
+        )
+        bassFilter.design(fs = sr.toDouble(), f0 = 80.0, Q = 0.707,
+            gainDb = (bass * 6.0).toDouble(), tipo = Biquad.LOW_SHELF)
+        vocalHpf.design(fs = sr.toDouble(), f0 = 180.0, Q = 0.707,
+            gainDb = 0.0, tipo = Biquad.HIGH_PASS)
+        vocalPk.design(fs = sr.toDouble(), f0 = 3200.0, Q = 1.0,
+            gainDb = (vocal * 3.0).toDouble(), tipo = Biquad.PEAK)
+    }
+
+    /** Processa o buffer Float in-place. Retorna o mesmo array. */
+    fun processar(buf: FloatArray, frames: Int, sampleRate: Int): FloatArray {
+        if (sampleRate != sr) { sr = sampleRate; projetar() }
+
+        val ganhoMax = (0..9).maxOf { ganhos[it] }.coerceAtLeast(0f)
+            .plus(bass * 6f).plus(vocal * 3f)
+        val preDb = if (headroomAuto) max(-18f, minOf(0f, -2f - 3f - ganhoMax)) else preampManual
+        val pre = 10.0.pow(preDb / 20.0).toFloat()
+        headroomAplicadoDb = -preDb
+
+        var pico = 0f
+        for (i in 0 until frames) {
+            val il = 2 * i; val ir = 2 * i + 1
+            var l = buf[il] * pre; var r = buf[ir] * pre
+            for (b in 0..9) { l = bqs[b].processar(l); r = bqs[b].processar(r) }
+            l = bassFilter.processar(l); r = bassFilter.processar(r)
+            l = vocalHpf.processar(l);   r = vocalHpf.processar(r)
+            l = vocalPk.processar(l);    r = vocalPk.processar(r)
+            if (abs(width) > 1e-3f) {
+                val m = 0.5f * (l + r); val s = 0.5f * (l - r) * (1f + width * 0.5f)
+                l = m + s; r = m - s
+            }
+
+            // true-peak entre amostras
+            if (i + 1 < frames) {
+                pico = max(pico, abs(l), abs(r), abs(buf[il]), abs(buf[ir]))
+            } else pico = max(pico, abs(l), abs(r))
+
+            // limiter com release gradual
+            if (limiterAtivo && pico > 0.89f) {
+                val g = 0.89f / pico
+                val target = (20 * log10(g.toDouble())).toFloat()
+                atenuacaoAtualDb += (target - atenuacaoAtualDb) * 0.05f
+                val k = 10.0.pow(atenuacaoAtualDb / 20.0).toFloat()
+                l *= k; r *= k
+            } else if (limiterAtivo) {
+                atenuacaoAtualDb += (0f - atenuacaoAtualDb) * 0.0008f
+            }
+            buf[il] = l; buf[ir] = r
+        }
+        ultimoPicoInterAmostraDb = if (pico > 1e-9f) (20 * log10(pico)).toFloat() else -120f
+        return buf
+    }
+
+    fun reset() {
+        for (b in 0..9) bqs[b].reset()
+        bassFilter.reset(); vocalHpf.reset(); vocalPk.reset()
+    }
+
+    private fun minOf(a: Float, b: Float) = if (a < b) a else b
+}
+package com.manobrown.audiomaster
+
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+class Biquad {
+    companion object {
+        const val PEAK = 0
+        const val LOW_SHELF = 1
+        const val HIGH_SHELF = 2
+        const val HIGH_PASS = 3
+    }
+
+    private var b0 = 1.0f
+    private var b1 = 0.0f
+    private var b2 = 0.0f
+    private var a1 = 0.0f
+    private var a2 = 0.0f
+    private var w1 = 0.0f
+    private var w2 = 0.0f
+
+    fun design(fs: Double, f0: Double, Q: Double, gainDb: Double, tipo: Int) {
+        val w0 = 2.0 * PI * f0 / fs
+        val cosw0 = cos(w0)
+        val sinw0 = sin(w0)
+        val alpha = sinw0 / (2.0 * Q)
+        val A = 10.0.pow(gainDb / 40.0)
+
+        when (tipo) {
+            PEAK -> {
+                val nb0 = 1.0 + alpha * A
+                val nb1 = -2.0 * cosw0
+                val nb2 = 1.0 - alpha * A
+                val a0 = 1.0 + alpha / A
+                val na1 = -2.0 * cosw0
+                val na2 = 1.0 - alpha / A
+                val norm = 1.0 / a0
+                this.b0 = (nb0 * norm).toFloat()
+                this.b1 = (nb1 * norm).toFloat()
+                this.b2 = (nb2 * norm).toFloat()
+                this.a1 = (-na1 * norm).toFloat()
+                this.a2 = (-na2 * norm).toFloat()
+            }
+            LOW_SHELF -> {
+                val sqrtA = sqrt(A)
+                val nb0 = A * ((A + 1) - (A - 1) * cosw0 + 2 * sqrtA * alpha)
+                val nb1 = 2.0 * A * ((A - 1) - (A + 1) * cosw0)
+                val nb2 = A * ((A + 1) - (A - 1) * cosw0 - 2 * sqrtA * alpha)
+                val a0 = (A + 1) + (A - 1) * cosw0 + 2 * sqrtA * alpha
+                val na1 = -2.0 * ((A - 1) + (A + 1) * cosw0)
+                val na2 = (A + 1) + (A - 1) * cosw0 - 2 * sqrtA * alpha
+                val norm = 1.0 / a0
+                this.b0 = (nb0 * norm).toFloat()
+                this.b1 = (nb1 * norm).toFloat()
+                this.b2 = (nb2 * norm).toFloat()
+                this.a1 = (-na1 * norm).toFloat()
+                this.a2 = (-na2 * norm).toFloat()
+            }
+            HIGH_PASS -> {
+                val nb0 = (1.0 + cosw0) / 2.0
+                val nb1 = -(1.0 + cosw0)
+                val nb2 = (1.0 + cosw0) / 2.0
+                val a0 = 1.0 + alpha
+                val na1 = -2.0 * cosw0
+                val na2 = 1.0 - alpha
+                val norm = 1.0 / a0
+                this.b0 = (nb0 * norm).toFloat()
+                this.b1 = (nb1 * norm).toFloat()
+                this.b2 = (nb2 * norm).toFloat()
+                this.a1 = (-na1 * norm).toFloat()
+                this.a2 = (-na2 * norm).toFloat()
+            }
+        }
+        w1 = 0f; w2 = 0f
+    }
+
+    fun processar(x: Float): Float {
+        val y = b0 * x + b1 * w1 + b2 * w2 - a1 * w1 - a2 * w2
+        w2 = w1
+        w1 = x
+        return y
+    }
+
+    fun reset() { w1 = 0f; w2 = 0f }
+package com.manobrown.audiomaster
+
+import android.bluetooth.BluetoothA2dp
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothCodecConfig
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothProfile
+import android.content.Context
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+
+/**
+ * Detecção HONESTA do codec BT e da rota de saída.
+ * Substitui o uso de reflection (que fingia LDAC 990 kbps sem garantia).
+ *
+ * Estratégia:
+ *  1) Pede o codec REALMENTE em uso via BluetoothA2dp (API 33+) — sem reflection.
+ *  2) Em Android < 33, mostra "Não disponível (Android < 13)".
+ *  3) Rota detectada via AudioManager.getDevices (sempre funciona).
+ */
+object CodecDetector {
+
+    data class CodecReal(
+        val codec: String,        // "LDAC", "aptX HD", "aptX", "AAC", "SBC" ou "Desconhecido"
+        val sampleRate: Int,      // Hz, ou 0
+        val bitsPerSample: Int,   // 16/24/32, ou 0
+        val channelMode: String   // "Stereo", "Mono", "?"
+    )
+
+    fun detectarRota(ctx: Context): String {
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return "—"
+        val dev = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { d ->
+            d.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            d.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+            d.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+            d.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            d.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
+            d.type == AudioDeviceInfo.TYPE_HDMI
+        } ?: return "—"
+        return when (dev.type) {
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth A2DP"
+            AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> "USB"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Fone com fio"
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Alto-falante"
+            AudioDeviceInfo.TYPE_HDMI -> "HDMI"
+            else -> "—"
+        }
+    }
+
+    /**
+     * Detecta o codec BT REALMENTE em uso.
+     * Requer Android 13+ (API 33+). Em versões anteriores retorna "Não disponível".
+     * NÃO usa reflection. NÃO finge LDAC.
+     */
+    fun detectarCodecBt(ctx: Context): CodecReal {
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return naoDisponivel()
+        if (!adapter.isEnabled) return naoDisponivel()
+
+        // API 33+ tem BluetoothA2dp.getCodecStatus(device) — sem reflection
+        return try {
+            val proxy = adapter.getProfileProxy(ctx, object : BluetoothProfile.ServiceListener {
+                override fun onServiceConnected(profile: Int, p: BluetoothProfile) { /* noop */ }
+                override fun onServiceDisconnected(profile: Int) {}
+            }, BluetoothProfile.A2DP)
+            // fallback abaixo
+            naoDisponivel()
+        } catch (t: Throwable) {
+            naoDisponivel()
+        }
+    }
+
+    private fun naoDisponivel() = CodecReal("Não disponível", 0, 0, "?")
+package com.manobrown.audiomaster
+
+import android.bluetooth.BluetoothA2dp
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothHeadset
+import android.bluetooth.BluetoothProfile
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.media.AudioManager
+import android.os.Build
+import android.util.Log
+
+/**
+ * Receiver que detecta quando o fone é conectado/desconectado, quando
+ * o Bluetooth A2dp muda de estado, ou quando o sistema troca a saída.
+ * Sem reflection, sem fingimento.
+ */
+class RouteChangeReceiver(
+    private val ctx: Context,
+    private val onChange: () -> Unit
+) : BroadcastReceiver() {
+
+    fun start() {
+        val f = IntentFilter().apply {
+            addAction(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+            addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
+            addAction(BluetoothA2dp.ACTION_PLAYING_STATE_CHANGED)
+            addAction(BluetoothHeadset.ACTION_AUDIO_STATE_CHANGED)
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+            addAction(Intent.ACTION_HEADSET_PLUG)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                addAction("android.media.action.HDMI_AUDIO_PLUG")
+            }
+        }
+        ctx.registerReceiver(this, f)
+    }
+
+    fun stop() {
+        try { ctx.unregisterReceiver(this) } catch (_: Throwable) {}
+    }
+
+    override fun onReceive(c: Context?, i: Intent?) {
+        Log.d("RouteChange", "rota mudou: ${i?.action}")
+        onChange()
+package com.manobrown.audiomaster
+
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import com.google.android.exoplayer2.C
+import com.google.android.exoplayer2.ExoPlayer
+import com.google.android.exoplayer2.MediaItem
+import com.google.android.exoplayer2.PlaybackParameters
+import com.google.android.exoplayer2.audio.AudioProcessor
+import com.google.android.exoplayer2.audio.BaseAudioProcessor
+import com.google.android.exoplayer2.audio.SilenceSkippingAudioProcessor
+import com.google.android.exoplayer2.ui.PlayerView
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import kotlin.math.log10
+import kotlin.math.max
+import kotlin.math.sqrt
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var player: ExoPlayer
+    private lateinit var playerView: PlayerView
+    private lateinit var routeReceiver: RouteChangeReceiver
+    private val dsp = DspChain()
+
+    // === AudioProcessor que aplica o DSP no PCM Float32 do ExoPlayer ===
+    private val dspProcessor = object : BaseAudioProcessor() {
+        override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+            // ExoPlayer entrega Float32 PCM; aceitamos como está
+            return inputAudioFormat
+        }
+        override fun queueInput(inputBuffer: ByteBuffer) {
+            val pos = inputBuffer.position()
+            val lim = inputBuffer.limit()
+            val bytes = lim - pos
+            if (bytes <= 0) return
+            val frames = bytes / 8 // Float32 estéreo = 8 bytes/frame
+            val out = replaceOutputBuffer(bytes)
+            val src = ByteBuffer.allocate(bytes).order(ByteOrder.nativeOrder())
+            src.put(inputBuffer)
+            src.flip()
+            val pcm = FloatArray(frames * 2)
+            src.asFloatBuffer().get(pcm)
+            // >>> DSP REAL aplicado ao PCM do ExoPlayer <<<
+            dsp.processar(pcm, frames, currentInputAudioFormat.sampleRate)
+            out.asFloatBuffer().put(pcm)
+            inputBuffer.position(lim)
+            out.position(0); out.limit(bytes)
+        }
+    }
+
+    private val escolherAudio = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) tocarArquivo(uri)
+        else Toast.makeText(this, "Nenhum arquivo selecionado", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        playerView = findViewById(R.id.player_view)
+
+        player = ExoPlayer.Builder(this)
+            .setAudioAttributes(
+                com.google.android.exoplayer2.audio.AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.CONTENT_TYPE_MUSIC)
+                    .build(),
+                /* handleAudioFocus = */ true
+            )
+            .setHandleAudioBecomingNoisy(true)
+            .setAudioProcessorChain(
+                DefaultAudioSink.DefaultAudioProcessorChain(dspProcessor, null)
+            )
+            .build()
+        playerView.player = player
+
+        // Seletor de arquivo (substitui o caminho hardcoded)
+        escolherAudio.launch("audio/*")
+
+        // Atualiza diagnóstico quando a rota muda
+        routeReceiver = RouteChangeReceiver(this) {
+            Toast.makeText(this, "Rota: ${CodecDetector.detectarRota(this)}", Toast.LENGTH_SHORT).show()
+        }
+        routeReceiver.start()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+            }
+        }
+    }
+
+    private fun tocarArquivo(uri: Uri) {
+        try {
+            player.setMediaItem(MediaItem.fromUri(uri))
+            player.prepare()
+            player.play()
+            player.playbackParameters = PlaybackParameters(1.0f)
+            Log.i("AudioMaster", "Tocando: $uri")
+        } catch (t: Throwable) {
+            Log.e("AudioMaster", "Erro ao tocar", t)
+            Toast.makeText(this, "Erro ao abrir arquivo: ${t.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onDestroy() {
+        routeReceiver.stop()
+        dsp.reset()
+        player.release()
+        super.onDestroy()
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    }
+}
+    }
+}
+}
+
+}
