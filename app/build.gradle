@@ -1,0 +1,29 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    compileSdk 33
+
+    defaultConfig {
+        applicationId "com.manobrown.audiomaster"
+        minSdk 24
+        targetSdk 33
+        versionCode 1
+        versionName "0.1"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib:1.8.22"
+    implementation "com.google.android.exoplayer:exoplayer:2.19.1"
+}
