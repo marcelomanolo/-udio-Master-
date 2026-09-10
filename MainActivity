@@ -567,3 +567,337 @@ class MainActivity : AppCompatActivity() {
 }
 
 }
+package com.manobrown.audiomaster
+
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
+
+class Biquad {
+    companion object {
+        const val PEAK = 0
+        const val LOW_SHELF = 1
+        const val HIGH_SHELF = 2
+        const val HIGH_PASS = 3
+    }
+
+    private var b0 = 1.0f
+    private var b1 = 0.0f
+    private var b2 = 0.0f
+    private var a1 = 0.0f
+    private var a2 = 0.0f
+    private var w1 = 0.0f
+    private var w2 = 0.0f
+
+    fun design(fs: Double, f0: Double, Q: Double, gainDb: Double, tipo: Int) {
+        val w0 = 2.0 * PI * f0 / fs
+        val cosw0 = cos(w0)
+        val sinw0 = sin(w0)
+        val alpha = sinw0 / (2.0 * Q)
+        val A = 10.0.pow(gainDb / 40.0)
+
+        when (tipo) {
+            PEAK -> {
+                val nb0 = 1.0 + alpha * A
+                val nb1 = -2.0 * cosw0
+                val nb2 = 1.0 - alpha * A
+                val a0 = 1.0 + alpha / A
+                val na1 = -2.0 * cosw0
+                val na2 = 1.0 - alpha / A
+                val norm = 1.0 / a0
+                this.b0 = (nb0 * norm).toFloat()
+                this.b1 = (nb1 * norm).toFloat()
+                this.b2 = (nb2 * norm).toFloat()
+                this.a1 = (-na1 * norm).toFloat()
+                this.a2 = (-na2 * norm).toFloat()
+            }
+            LOW_SHELF -> {
+                val sqrtA = sqrt(A)
+                val nb0 = A * ((A + 1) - (A - 1) * cosw0 + 2 * sqrtA * alpha)
+                val nb1 = 2.0 * A * ((A - 1) - (A + 1) * cosw0)
+                val nb2 = A * ((A + 1) - (A - 1) * cosw0 - 2 * sqrtA * alpha)
+                val a0 = (A + 1) + (A - 1) * cosw0 + 2 * sqrtA * alpha
+                val na1 = -2.0 * ((A - 1) + (A + 1) * cosw0)
+                val na2 = (A + 1) + (A - 1) * cosw0 - 2 * sqrtA * alpha
+                val norm = 1.0 / a0
+                this.b0 = (nb0 * norm).toFloat()
+                this.b1 = (nb1 * norm).toFloat()
+                this.b2 = (nb2 * norm).toFloat()
+                this.a1 = (-na1 * norm).toFloat()
+                this.a2 = (-na2 * norm).toFloat()
+            }
+            HIGH_PASS -> {
+                val nb0 = (1.0 + cosw0) / 2.0
+                val nb1 = -(1.0 + cosw0)
+                val nb2 = (1.0 + cosw0) / 2.0
+                val a0 = 1.0 + alpha
+                val na1 = -2.0 * cosw0
+                val na2 = 1.0 - alpha
+                val norm = 1.0 / a0
+                this.b0 = (nb0 * norm).toFloat()
+                this.b1 = (nb1 * norm).toFloat()
+                this.b2 = (nb2 * norm).toFloat()
+                this.a1 = (-na1 * norm).toFloat()
+                this.a2 = (-na2 * norm).toFloat()
+            }
+        }
+        w1 = 0f; w2 = 0f
+    }
+
+    fun processar(x: Float): Float {
+        val y = b0 * x + b1 * w1 + b2 * w2 - a1 * w1 - a2 * w2
+        w2 = w1
+        w1 = x
+        return y
+    }
+
+    fun reset() { w1 = 0f; w2 = 0f }
+}  // <<< FALTAVA ESTE fecha-classe
+package com.manobrown.audiomaster
+
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothProfile
+import android.content.Context
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+
+object CodecDetector {
+
+    data class CodecReal(
+        val codec: String,
+        val sampleRate: Int,
+        val bitsPerSample: Int,
+        val channelMode: String
+    )
+
+    fun detectarRota(ctx: Context): String {
+        val am = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return "—"
+        val dev = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { d ->
+            d.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            d.type == AudioDeviceInfo.TYPE_USB_DEVICE ||
+            d.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+            d.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            d.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER ||
+            d.type == AudioDeviceInfo.TYPE_HDMI
+        } ?: return "—"
+        return when (dev.type) {
+            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP -> "Bluetooth A2DP"
+            AudioDeviceInfo.TYPE_USB_DEVICE, AudioDeviceInfo.TYPE_USB_HEADSET -> "USB"
+            AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Fone com fio"
+            AudioDeviceInfo.TYPE_BUILTIN_SPEAKER -> "Alto-falante"
+            AudioDeviceInfo.TYPE_HDMI -> "HDMI"
+            else -> "—"
+        }
+    }
+
+    fun detectarCodecBt(ctx: Context): CodecReal {
+        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return naoDisponivel()
+        if (!adapter.isEnabled) return naoDisponivel()
+        // Em Android 13+ o codec real é lido via BluetoothA2dp.getCodecStatus(device).
+        // Como isso requer ServiceListener assíncrono, retornamos "Não disponível"
+        // honestamente em vez de fingir. Para ligar a leitura real, me peça.
+        return naoDisponivel()
+    }
+
+    private fun naoDisponivel() = CodecReal("Não disponível", 0, 0, "?")
+}  // <<< FALTAVA ESTE fecha-classe
+package com.manobrown.audiomaster
+
+import android.bluetooth.BluetoothA2dp
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothHeadset
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.media.AudioManager
+import android.os.Build
+import android.util.Log
+
+class RouteChangeReceiver(
+    private val ctx: Context,
+    private val onChange: () -> Unit
+) : BroadcastReceiver() {
+
+    fun start() {
+        val f = IntentFilter().apply {
+            addAction(AudioManager.ACTION_AUDIO_BECOMING_NOISY)
+            addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
+            addAction(BluetoothA2dp.ACTION_PLAYING_STATE_CHANGED)
+            addAction(BluetoothHeadset.ACTION_AUDIO_STATE_CHANGED)
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+            addAction(Intent.ACTION_HEADSET_PLUG)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                addAction("android.media.action.HDMI_AUDIO_PLUG")
+            }
+        }
+        ctx.registerReceiver(this, f)
+    }
+
+    fun stop() {
+        try { ctx.unregisterReceiver(this) } catch (_: Throwable) {}
+    }
+
+    override fun onReceive(c: Context?, i: Intent?) {
+        Log.d("RouteChange", "rota mudou: ${i?.action}")
+        onChange()
+    }
+}  // <<< FALTAVA ESTE fecha-classe
+package com.manobrown.audiomaster
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.util.Log
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import com.google.android.exoplayer2.C
+import com.google.android.exoplayer2.ExoPlayer
+import com.google.android.exoplayer2.MediaItem
+import com.google.android.exoplayer2.PlaybackParameters
+import com.google.android.exoplayer2.audio.AudioProcessor
+import com.google.android.exoplayer2.audio.BaseAudioProcessor
+import com.google.android.exoplayer2.audio.DefaultAudioSink
+import com.google.android.exoplayer2.audio.DefaultRenderersFactory
+import com.google.android.exoplayer2.audio.SilenceSkippingAudioProcessor
+import com.google.android.exoplayer2.ui.PlayerView
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var player: ExoPlayer
+    private lateinit var playerView: PlayerView
+    private lateinit var routeReceiver: RouteChangeReceiver
+    private val dsp = DspChain()
+
+    /**
+     * AudioProcessor que aplica o DSP REAL no PCM Float32 do ExoPlayer.
+     * Este é o ponto onde o equalizador realmente modifica as amostras.
+     */
+    private val dspProcessor = object : BaseAudioProcessor() {
+        override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
+            // ExoPlayer entrega Float32 PCM; aceitamos como está.
+            return inputAudioFormat
+        }
+
+        override fun queueInput(inputBuffer: ByteBuffer) {
+            val pos = inputBuffer.position()
+            val lim = inputBuffer.limit()
+            val bytes = lim - pos
+            if (bytes <= 0) return
+
+            val frames = bytes / 8 // Float32 estéreo = 8 bytes/frame
+            val out = replaceOutputBuffer(bytes)
+            val src = ByteBuffer.allocate(bytes).order(ByteOrder.nativeOrder())
+            src.put(inputBuffer)
+            src.flip()
+            val pcm = FloatArray(frames * 2)
+            src.asFloatBuffer().get(pcm)
+
+            // >>> DSP REAL aplicado ao PCM do ExoPlayer <<<
+            dsp.processar(pcm, frames, currentInputAudioFormat.sampleRate)
+
+            out.asFloatBuffer().put(pcm)
+            inputBuffer.position(lim)
+            out.position(0); out.limit(bytes)
+        }
+    }
+
+    private val escolherAudio = registerForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) tocarArquivo(uri)
+        else Toast.makeText(this, "Nenhum arquivo selecionado", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        playerView = findViewById(R.id.player_view)
+
+        // >>> CORREÇÃO PRINCIPAL: forma correta de injetar AudioProcessor no ExoPlayer 2.19.1 <<<
+        val audioProcessors = arrayOf<AudioProcessor>(dspProcessor, SilenceSkippingAudioProcessor())
+
+        val renderersFactory = DefaultRenderersFactory(this)
+            .setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_OFF)
+            .setAudioProcessors(audioProcessors)   // <<< DSP entra AQUI
+
+        player = ExoPlayer.Builder(this, renderersFactory)
+            .setAudioAttributes(
+                com.google.android.exoplayer2.audio.AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(C.CONTENT_TYPE_MUSIC)
+                    .build(),
+                /* handleAudioFocus = */ true
+            )
+            .setHandleAudioBecomingNoisy(true)
+            .build()
+
+        playerView.player = player
+
+        // Seletor de arquivo (substitui o caminho hardcoded que quebrava)
+        escolherAudio.launch("audio/*")
+
+        // Receiver de troca de rota — atualiza detecção sem fingir codec
+        routeReceiver = RouteChangeReceiver(this) {
+            val rota = CodecDetector.detectarRota(this)
+            Log.d("MainActivity", "Rota atual: $rota")
+            // (Se quiser, pode atualizar um TextView aqui)
+        }
+        routeReceiver.start()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+            }
+        }
+    }
+
+    private fun tocarArquivo(uri: Uri) {
+        try {
+            player.setMediaItem(MediaItem.fromUri(uri))
+            player.prepare()
+            player.play()
+            player.playbackParameters = PlaybackParameters(1.0f)
+            Log.i("AudioMaster", "Tocando: $uri")
+        } catch (t: Throwable) {
+            Log.e("AudioMaster", "Erro ao tocar", t)
+            Toast.makeText(this, "Erro ao abrir arquivo: ${t.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onDestroy() {
+        routeReceiver.stop()
+        dsp.reset()
+        player.release()
+        super.onDestroy()
+// === Conexão dos 10 SeekBars do EQ ao DspChain ===
+private val seekBarIds = intArrayOf(
+    R.id.seek_31, R.id.seek_62, R.id.seek_125, R.id.seek_250, R.id.seek_500,
+    R.id.seek_1k, R.id.seek_2k, R.id.seek_4k, R.id.seek_8k, R.id.seek_16k
+)
+// dentro do onCreate, depois de findViewById(R.id.player_view):
+seekBarIds.forEachIndexed { indice, id ->
+    val sb = findViewById<android.widget.SeekBar>(id)
+    sb.max = 24; sb.progress = 12
+    sb.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+        override fun onProgressChanged(s: android.widget.SeekBar?, p: Int, fromUser: Boolean) {
+            if (!fromUser) return
+            dsp.setBanda(indice, (p - 12).toFloat())  // -12..+12 dB
+        }
+        override fun onStartTrackingTouch(s: android.widget.SeekBar?) = Unit
+        override fun onStopTrackingTouch(s: android.widget.SeekBar?) = Unit
+    })
+}
+
+    }
+}
+
+
